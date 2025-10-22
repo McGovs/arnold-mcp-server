@@ -3,8 +3,11 @@ import cors from 'cors';
 import { BetaAnalyticsDataClient } from '@google-analytics/data';
 import { OAuth2Client } from 'google-auth-library';
 import dotenv from 'dotenv';
+import pg from 'pg';
 
 dotenv.config();
+
+const { Pool } = pg;
 
 const app = express();
 app.use(cors());
@@ -12,11 +15,73 @@ app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 
+// PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? {
+    rejectUnauthorized: false
+  } : false,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000
+});
+
+// Handle pool errors
+pool.on('error', (err) => {
+  console.error('Unexpected database pool error:', err);
+});
+
 // OAuth2 client for token validation and refresh
 const oauth2Client = new OAuth2Client(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET
 );
+
+// Initialize database tables
+async function initDatabaseTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS arnold_users (
+        id SERIAL PRIMARY KEY,
+        slack_user_id VARCHAR(255) UNIQUE NOT NULL,
+        google_access_token TEXT NOT NULL,
+        google_refresh_token TEXT NOT NULL,
+        token_expires_at BIGINT NOT NULL,
+        ga_property_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_slack_user_id 
+      ON arnold_users(slack_user_id)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id SERIAL PRIMARY KEY,
+        slack_user_id VARCHAR(255),
+        action VARCHAR(100),
+        property_id VARCHAR(255),
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        success BOOLEAN,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_audit_slack_user 
+      ON audit_logs(slack_user_id, created_at DESC)
+    `);
+    
+    console.log('✅ Database tables initialized');
+  } catch (error) {
+    console.error('Database init error:', error);
+  }
+}
 
 // API Key middleware for security
 const authenticateApiKey = (req, res, next) => {
@@ -39,31 +104,19 @@ const authenticateApiKey = (req, res, next) => {
   next();
 };
 
-// Health check endpoint (no auth required)
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    version: '2.0.0'
-  });
-});
-
 // Validate and refresh OAuth token if needed
 async function getValidAccessToken(userAccessToken, refreshToken = null) {
   try {
-    // Set the credentials
     oauth2Client.setCredentials({
       access_token: userAccessToken,
       refresh_token: refreshToken
     });
 
-    // Try to get token info to validate it
     try {
       const tokenInfo = await oauth2Client.getTokenInfo(userAccessToken);
       console.log('Token is valid, expires at:', new Date(tokenInfo.expiry_date));
       return userAccessToken;
     } catch (error) {
-      // Token might be expired, try to refresh if we have refresh token
       if (refreshToken) {
         console.log('Token expired, attempting refresh...');
         const { credentials } = await oauth2Client.refreshAccessToken();
@@ -78,40 +131,106 @@ async function getValidAccessToken(userAccessToken, refreshToken = null) {
   }
 }
 
+// Audit logging function
+async function logAuditEvent(slackUserId, action, propertyId, req, success, errorMessage = null) {
+  try {
+    await pool.query(`
+      INSERT INTO audit_logs 
+        (slack_user_id, action, property_id, ip_address, user_agent, success, error_message)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `, [
+      slackUserId,
+      action,
+      propertyId,
+      req.ip || req.headers['x-forwarded-for'] || 'unknown',
+      req.headers['user-agent'] || 'unknown',
+      success,
+      errorMessage
+    ]);
+  } catch (error) {
+    console.error('Failed to log audit event:', error);
+  }
+}
+
+// Validate property ID format
+function validatePropertyId(propertyId) {
+  const propertyIdRegex = /^properties\/\d+$/;
+  return propertyIdRegex.test(propertyId);
+}
+
+// Request validation middleware
+const validateAnalyticsRequest = (req, res, next) => {
+  const { tool, args, userAccessToken } = req.body;
+  
+  if (!tool || typeof tool !== 'string') {
+    return res.status(400).json({
+      error: 'Invalid request',
+      message: 'tool field is required and must be a string'
+    });
+  }
+  
+  if (!args || typeof args !== 'object') {
+    return res.status(400).json({
+      error: 'Invalid request',
+      message: 'args field is required and must be an object'
+    });
+  }
+  
+  if (!args.property || !validatePropertyId(args.property)) {
+    return res.status(400).json({
+      error: 'Invalid property ID',
+      message: 'property must be in format: properties/123456789'
+    });
+  }
+  
+  if (!userAccessToken || typeof userAccessToken !== 'string') {
+    return res.status(400).json({
+      error: 'Invalid request',
+      message: 'userAccessToken is required'
+    });
+  }
+  
+  if (args.dateRanges && Array.isArray(args.dateRanges)) {
+    for (const range of args.dateRanges) {
+      if (!range.startDate || !range.endDate) {
+        return res.status(400).json({
+          error: 'Invalid date range',
+          message: 'Each dateRange must have startDate and endDate'
+        });
+      }
+    }
+  }
+  
+  next();
+};
+
+// Health check endpoint (no auth required)
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    version: '2.0.0'
+  });
+});
+
 // Main MCP endpoint for Google Analytics queries
-app.post('/mcp/analytics', authenticateApiKey, async (req, res) => {
+app.post('/mcp/analytics', authenticateApiKey, validateAnalyticsRequest, async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     console.log('Received request:', JSON.stringify(req.body, null, 2));
 
     const { tool, args, userAccessToken, refreshToken } = req.body;
 
-    // Validate tool
-    if (!tool || tool !== 'ga.runReport') {
+    if (tool !== 'ga.runReport') {
       return res.status(400).json({
         error: 'Invalid tool specified',
         message: 'Expected tool: "ga.runReport"'
       });
     }
 
-    // Validate required parameters
-    if (!args || !args.property) {
-      return res.status(400).json({
-        error: 'Missing required parameters',
-        message: 'Required: args.property'
-      });
-    }
-
-    // CRITICAL: User access token is REQUIRED for client data
-    if (!userAccessToken) {
-      return res.status(400).json({
-        error: 'User access token required',
-        message: 'userAccessToken is required to access client Google Analytics data'
-      });
-    }
-
     console.log('Validating user OAuth token...');
     
-    // Validate and potentially refresh the token
     const validAccessToken = await getValidAccessToken(userAccessToken, refreshToken);
     
     console.log('Using user OAuth token for client:', args.property);
@@ -121,7 +240,6 @@ app.post('/mcp/analytics', authenticateApiKey, async (req, res) => {
       authClient: oauth2Client
     });
 
-    // Build the request for Google Analytics
     const gaRequest = {
       property: args.property,
       dateRanges: args.dateRanges || [{ startDate: '7daysAgo', endDate: 'today' }],
@@ -134,15 +252,20 @@ app.post('/mcp/analytics', authenticateApiKey, async (req, res) => {
     };
 
     console.log('Sending request to Google Analytics...');
-    console.log('Request details:', JSON.stringify(gaRequest, null, 2));
 
-    // Call Google Analytics Data API using client's credentials
     const [response] = await analyticsDataClient.runReport(gaRequest);
 
     console.log('Received response from Google Analytics');
     console.log(`Returned ${response.rows?.length || 0} rows`);
 
-    // Format the response
+    await logAuditEvent(
+      'unknown',
+      'analytics_query',
+      args.property,
+      req,
+      true
+    );
+
     const formattedResponse = {
       success: true,
       data: {
@@ -168,12 +291,22 @@ app.post('/mcp/analytics', authenticateApiKey, async (req, res) => {
       property: args.property
     };
 
+    console.log(`Query completed in ${Date.now() - startTime}ms`);
+
     res.json(formattedResponse);
 
   } catch (error) {
     console.error('Error processing request:', error);
     
-    // Provide detailed error messages
+    await logAuditEvent(
+      'unknown',
+      'analytics_query',
+      req.body.args?.property,
+      req,
+      false,
+      error.message
+    );
+
     let errorMessage = error.message;
     let errorCode = 500;
 
@@ -248,6 +381,185 @@ app.post('/analytics/query', authenticateApiKey, async (req, res) => {
   }
 });
 
+// Store user tokens after OAuth
+app.post('/users/tokens', authenticateApiKey, async (req, res) => {
+  try {
+    const { 
+      slackUserId, 
+      accessToken, 
+      refreshToken, 
+      expiresIn, 
+      propertyId 
+    } = req.body;
+
+    if (!slackUserId || !accessToken || !refreshToken) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        required: ['slackUserId', 'accessToken', 'refreshToken']
+      });
+    }
+
+    const expiresAt = Date.now() + (expiresIn * 1000);
+
+    const query = `
+      INSERT INTO arnold_users 
+        (slack_user_id, google_access_token, google_refresh_token, token_expires_at, ga_property_id, updated_at)
+      VALUES 
+        ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+      ON CONFLICT (slack_user_id) 
+      DO UPDATE SET
+        google_access_token = $2,
+        google_refresh_token = $3,
+        token_expires_at = $4,
+        ga_property_id = $5,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING id, slack_user_id, token_expires_at
+    `;
+
+    const result = await pool.query(query, [
+      slackUserId,
+      accessToken,
+      refreshToken,
+      expiresAt,
+      propertyId
+    ]);
+
+    res.json({
+      success: true,
+      message: 'User tokens stored successfully',
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Error storing user tokens:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get user tokens
+app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
+  try {
+    const { slackUserId } = req.params;
+
+    const query = `
+      SELECT 
+        slack_user_id,
+        google_access_token,
+        google_refresh_token,
+        token_expires_at,
+        ga_property_id
+      FROM arnold_users
+      WHERE slack_user_id = $1
+    `;
+
+    const result = await pool.query(query, [slackUserId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+        message: 'This user has not connected their Google Analytics account'
+      });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      success: true,
+      slackUserId: user.slack_user_id,
+      accessToken: user.google_access_token,
+      refreshToken: user.google_refresh_token,
+      expiresAt: user.token_expires_at,
+      isExpired: Date.now() > user.token_expires_at,
+      propertyId: user.ga_property_id
+    });
+
+  } catch (error) {
+    console.error('Error fetching user tokens:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Update user's property ID
+app.patch('/users/:slackUserId/property', authenticateApiKey, async (req, res) => {
+  try {
+    const { slackUserId } = req.params;
+    const { propertyId } = req.body;
+
+    if (!propertyId) {
+      return res.status(400).json({
+        error: 'Property ID required'
+      });
+    }
+
+    const query = `
+      UPDATE arnold_users
+      SET ga_property_id = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE slack_user_id = $2
+      RETURNING slack_user_id, ga_property_id
+    `;
+
+    const result = await pool.query(query, [propertyId, slackUserId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Error updating property ID:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Delete user tokens (disconnect)
+app.delete('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
+  try {
+    const { slackUserId } = req.params;
+
+    const query = `
+      DELETE FROM arnold_users
+      WHERE slack_user_id = $1
+      RETURNING slack_user_id
+    `;
+
+    const result = await pool.query(query, [slackUserId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'User tokens deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Error deleting user tokens:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // Token refresh endpoint
 app.post('/oauth/refresh', authenticateApiKey, async (req, res) => {
   try {
@@ -282,143 +594,115 @@ app.post('/oauth/refresh', authenticateApiKey, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Arnold MCP Server v2.0 running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`🔍 MCP endpoint: http://localhost:${PORT}/mcp/analytics`);
-  console.log(`📈 Direct endpoint: http://localhost:${PORT}/analytics/query`);
-  console.log(`🔄 Token refresh: http://localhost:${PORT}/oauth/refresh`);
-  console.log(`⚠️  User OAuth token REQUIRED for all analytics queries`);
+// List all connected users (admin only)
+app.get('/users', authenticateApiKey, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        slack_user_id,
+        ga_property_id,
+        token_expires_at,
+        created_at,
+        updated_at
+      FROM arnold_users
+      ORDER BY created_at DESC
+    `;
+
+    const result = await pool.query(query);
+
+    res.json({
+      success: true,
+      count: result.rows.length,
+      users: result.rows.map(user => ({
+        slackUserId: user.slack_user_id,
+        propertyId: user.ga_property_id,
+        isTokenExpired: Date.now() > user.token_expires_at,
+        connectedAt: user.created_at,
+        lastUpdated: user.updated_at
+      }))
+    });
+
+  } catch (error) {
+    console.error('Error listing users:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
-```
 
-Click "Commit changes..." → "Commit changes"
+// API Documentation endpoint
+app.get('/docs', (req, res) => {
+  res.json({
+    name: 'Arnold MCP Server',
+    version: '2.0.0',
+    description: 'Google Analytics Data API via Model Context Protocol',
+    endpoints: {
+      health: {
+        method: 'GET',
+        path: '/health',
+        description: 'Health check endpoint',
+        auth: 'None'
+      },
+      analytics: {
+        method: 'POST',
+        path: '/mcp/analytics',
+        description: 'Run Google Analytics query',
+        auth: 'X-API-Key header',
+        body: {
+          tool: 'string (required) - Must be "ga.runReport"',
+          args: {
+            property: 'string (required) - Format: properties/123456789',
+            dateRanges: 'array - [{ startDate, endDate }]',
+            dimensions: 'array - [{ name }]',
+            metrics: 'array - [{ name }]',
+            limit: 'number - Max rows to return',
+            offset: 'number - Pagination offset'
+          },
+          userAccessToken: 'string (required) - User\'s OAuth access token',
+          refreshToken: 'string (optional) - For automatic token refresh'
+        }
+      },
+      storeTokens: {
+        method: 'POST',
+        path: '/users/tokens',
+        description: 'Store user OAuth tokens',
+        auth: 'X-API-Key header'
+      },
+      getTokens: {
+        method: 'GET',
+        path: '/users/:slackUserId/tokens',
+        description: 'Retrieve user tokens',
+        auth: 'X-API-Key header'
+      },
+      refreshToken: {
+        method: 'POST',
+        path: '/oauth/refresh',
+        description: 'Refresh expired access token',
+        auth: 'X-API-Key header'
+      }
+    },
+    support: 'https://github.com/yourusername/arnold-mcp-server'
+  });
+});
 
----
+// Serve docs at root
+app.get('/', (req, res) => {
+  res.redirect('/docs');
+});
 
-**File 3: `.gitignore`**
+// Start server
+async function startServer() {
+  await initDatabaseTables();
+  
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Arnold MCP Server v2.0 running on port ${PORT}`);
+    console.log(`📊 Health check: http://localhost:${PORT}/health`);
+    console.log(`🔍 MCP endpoint: http://localhost:${PORT}/mcp/analytics`);
+    console.log(`📈 Direct endpoint: http://localhost:${PORT}/analytics/query`);
+    console.log(`🔄 Token refresh: http://localhost:${PORT}/oauth/refresh`);
+    console.log(`⚠️  User OAuth token REQUIRED for all analytics queries`);
+  });
+}
 
-Click "Add file" → "Create new file"
-Name: `.gitignore`
-```
-node_modules/
-.env
-.DS_Store
-*.log
-.vscode/
-credentials.json
-token.json
-```
-
-Click "Commit changes..." → "Commit changes"
-
-**✅ Code files created!**
-
----
-
-## Phase 4: Deploy to Railway (15 minutes)
-
-### Step 4.1: Connect GitHub to Railway
-
-1. Go back to https://railway.app
-2. Click "New Project"
-3. Click "Deploy from GitHub repo"
-4. If this is your first time: Click "Configure GitHub App"
-   - Choose "Only select repositories"
-   - Select `arnold-mcp-server`
-   - Click "Install & Authorize"
-5. You'll see your repository listed
-6. Click on `arnold-mcp-server`
-7. Click "Deploy Now"
-
-### Step 4.2: Add Environment Variables
-
-1. After deployment starts, click on your project
-2. Click on the service (should say "arnold-mcp-server")
-3. Click the "Variables" tab
-
-**Add Variable 1: GOOGLE_CLIENT_ID**
-
-1. Click "New Variable"
-2. Variable name: `GOOGLE_CLIENT_ID`
-3. Variable value: Paste your Client ID from Step 2.4
-4. Click "Add"
-
-**Add Variable 2: GOOGLE_CLIENT_SECRET**
-
-1. Click "New Variable"
-2. Variable name: `GOOGLE_CLIENT_SECRET`
-3. Variable value: Paste your Client Secret from Step 2.4
-4. Click "Add"
-
-**Add Variable 3: API_KEY**
-
-1. Click "New Variable"
-2. Variable name: `API_KEY`
-3. Variable value: Generate a random string (use https://www.uuidgenerator.net/)
-   - Example: `a7f3c9e2-5b8d-4f1a-9c3e-7d2b8f4a6e1c`
-4. Click "Add"
-
-**Add Variable 4: NODE_ENV**
-
-1. Click "New Variable"
-2. Variable name: `NODE_ENV`
-3. Variable value: `production`
-4. Click "Add"
-
-### Step 4.3: Get Your Public URL
-
-1. Click the "Settings" tab
-2. Scroll to "Networking" section
-3. Click "Generate Domain"
-4. Railway will create a public URL like: `arnold-mcp-server-production.up.railway.app`
-5. **Copy this URL** - you'll need it!
-
-### Step 4.4: Update OAuth Redirect URIs
-
-1. Go back to Google Cloud Console
-2. APIs & Services → Credentials
-3. Click on your OAuth 2.0 Client ID
-4. Under "Authorized redirect URIs", add:
-   - `https://[YOUR-RAILWAY-URL]/oauth/callback`
-5. Click "SAVE"
-
-### Step 4.5: Test Your Deployment
-
-1. Open a new browser tab
-2. Go to: `https://[YOUR-RAILWAY-URL]/health`
-3. You should see: `{"status":"healthy","version":"2.0.0",...}`
-
-**🎉 Your server is live!**
-
----
-
-## Phase 5: Slack App OAuth Flow (CRITICAL)
-
-This is where you capture the user's OAuth token.
-
-### Step 5.1: Configure Slack OAuth
-
-In your Slack app configuration:
-
-1. Go to https://api.slack.com/apps
-2. Select your Arnold app
-3. Go to "OAuth & Permissions"
-4. Under "Redirect URLs", add your OAuth callback URL
-5. Under "Scopes", make sure you have the permissions you need
-
-### Step 5.2: Add Google OAuth to Your Slack App
-
-When a user installs/opens your Slack app:
-
-1. **User clicks "Connect Google Analytics"** button in Slack
-2. **Slack app redirects to Google OAuth URL:**
-```
-https://accounts.google.com/o/oauth2/v2/auth?
-  client_id=YOUR_CLIENT_ID
-  &redirect_uri=https://your-slack-app-backend/oauth/callback
-  &response_type=code
-  &scope=https://www.googleapis.com/auth/analytics.readonly
-  &access_type=offline
-  &prompt=consent
-  &state=USER_SLACK_ID
+startServer();
