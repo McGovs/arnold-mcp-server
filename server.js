@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import axios from 'axios';
 import { BetaAnalyticsDataClient } from '@google-analytics/data';
 import { OAuth2Client } from 'google-auth-library';
 import dotenv from 'dotenv';
@@ -487,12 +488,7 @@ app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
 });
 
 // Get user's GA4 properties
-app.get('/users/:slackUserId/properties', async (req, res) => {
-  const apiKey = req.headers['x-api-key'];
-  
-  if (apiKey !== process.env.MCP_API_KEY) {
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
-  }
+app.get('/users/:slackUserId/properties', authenticateApiKey, async (req, res) => {
   
   const { slackUserId } = req.params;
   
@@ -517,7 +513,7 @@ app.get('/users/:slackUserId/properties', async (req, res) => {
       'https://analyticsadmin.googleapis.com/v1beta/accountSummaries',
       {
         headers: {
-          'Authorization': `Bearer ${access_token}`
+          'Authorization': `Bearer ${google_access_token}`
         }
       }
     );
