@@ -440,7 +440,7 @@ app.post('/users/tokens', authenticateApiKey, async (req, res) => {
   }
 });
 
-// Get user tokens
+// Get user tokens (with auto-refresh if expired)
 app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
   try {
     const { slackUserId } = req.params;
@@ -467,15 +467,63 @@ app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
     }
 
     const user = result.rows[0];
+    let accessToken = user.google_access_token;
+    let expiresAt = user.token_expires_at;
+    let wasRefreshed = false;
+
+    // Check if token is expired
+    const isExpired = Date.now() > user.token_expires_at;
+
+    if (isExpired) {
+      console.log(`Token expired for user ${slackUserId}, refreshing...`);
+      
+      try {
+        // Refresh the token
+        const refreshResponse = await axios.post('https://oauth2.googleapis.com/token', {
+          client_id: process.env.GOOGLE_CLIENT_ID,
+          client_secret: process.env.GOOGLE_CLIENT_SECRET,
+          refresh_token: user.google_refresh_token,
+          grant_type: 'refresh_token'
+        });
+        
+        accessToken = refreshResponse.data.access_token;
+        const expiresIn = refreshResponse.data.expires_in || 3600;
+        expiresAt = Date.now() + (expiresIn * 1000);
+        wasRefreshed = true;
+        
+        // Update database with new token
+        await pool.query(
+          'UPDATE arnold_users SET google_access_token = $1, token_expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE slack_user_id = $3',
+          [accessToken, expiresAt, slackUserId]
+        );
+        
+        console.log(`Token refreshed successfully for user ${slackUserId}`);
+      } catch (refreshError) {
+        console.error('Failed to refresh token:', refreshError.response?.data || refreshError.message);
+        // Return the expired token and let the caller handle it
+        return res.json({
+          success: true,
+          slackUserId: user.slack_user_id,
+          accessToken: user.google_access_token,
+          refreshToken: user.google_refresh_token,
+          expiresAt: user.token_expires_at,
+          isExpired: true,
+          propertyId: user.ga_property_id,
+          refreshFailed: true,
+          error: 'Token expired and refresh failed - user needs to re-authenticate'
+        });
+      }
+    }
 
     res.json({
       success: true,
       slackUserId: user.slack_user_id,
-      accessToken: user.google_access_token,
+      accessToken: accessToken,
       refreshToken: user.google_refresh_token,
-      expiresAt: user.token_expires_at,
-      isExpired: Date.now() > user.token_expires_at,
-      propertyId: user.ga_property_id
+      expiresAt: expiresAt,
+      isExpired: false,
+      propertyId: user.ga_property_id,
+      wasRefreshed: wasRefreshed
     });
 
   } catch (error) {
@@ -549,7 +597,7 @@ app.get('/users/:slackUserId/properties', authenticateApiKey, async (req, res) =
   }
 });
 
-// Refresh access token (NEW ENDPOINT)
+// Refresh access token
 app.post('/oauth/refresh', authenticateApiKey, async (req, res) => {
   const { slackUserId, refreshToken } = req.body;
   
@@ -750,13 +798,13 @@ app.get('/docs', (req, res) => {
       getTokens: {
         method: 'GET',
         path: '/users/:slackUserId/tokens',
-        description: 'Retrieve user tokens',
+        description: 'Retrieve user tokens (auto-refreshes if expired)',
         auth: 'X-API-Key header'
       },
       refreshToken: {
         method: 'POST',
         path: '/oauth/refresh',
-        description: 'Refresh expired access token',
+        description: 'Manually refresh expired access token',
         auth: 'X-API-Key header'
       }
     },
@@ -778,7 +826,7 @@ async function startServer() {
     console.log(`📊 Health check: http://localhost:${PORT}/health`);
     console.log(`🔍 MCP endpoint: http://localhost:${PORT}/mcp/analytics`);
     console.log(`📈 Direct endpoint: http://localhost:${PORT}/analytics/query`);
-    console.log(`🔄 Token refresh: http://localhost:${PORT}/oauth/refresh`);
+    console.log(`🔄 Token auto-refresh: Enabled in GET /users/:slackUserId/tokens`);
     console.log(`⚠️  User OAuth token REQUIRED for all analytics queries`);
   });
 }
