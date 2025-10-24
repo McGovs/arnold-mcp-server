@@ -486,6 +486,73 @@ app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
   }
 });
 
+// Get user's GA4 properties
+app.get('/users/:slackUserId/properties', async (req, res) => {
+  const apiKey = req.headers['x-api-key'];
+  
+  if (apiKey !== process.env.MCP_API_KEY) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  
+  const { slackUserId } = req.params;
+  
+  try {
+    // Get user's tokens from database
+    const result = await pool.query(
+      'SELECT access_token, refresh_token FROM user_tokens WHERE slack_user_id = $1',
+      [slackUserId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'User not found' 
+      });
+    }
+    
+    const { access_token, refresh_token } = result.rows[0];
+    
+    // Fetch properties from Google Analytics Admin API
+    const response = await axios.get(
+      'https://analyticsadmin.googleapis.com/v1beta/accountSummaries',
+      {
+        headers: {
+          'Authorization': `Bearer ${access_token}`
+        }
+      }
+    );
+    
+    // Extract properties
+    const properties = [];
+    
+    if (response.data.accountSummaries) {
+      for (const account of response.data.accountSummaries) {
+        if (account.propertySummaries) {
+          for (const prop of account.propertySummaries) {
+            properties.push({
+              id: prop.property,
+              name: prop.displayName,
+              account: account.displayName
+            });
+          }
+        }
+      }
+    }
+    
+    res.json({
+      success: true,
+      properties: properties
+    });
+    
+  } catch (error) {
+    console.error('Error fetching properties:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
 // Update user's property ID
 app.patch('/users/:slackUserId/property', authenticateApiKey, async (req, res) => {
   try {
