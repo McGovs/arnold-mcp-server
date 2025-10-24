@@ -1,5 +1,4 @@
 import express from 'express';
-import axios from 'axios';
 import cors from 'cors';
 import { BetaAnalyticsDataClient } from '@google-analytics/data';
 import { OAuth2Client } from 'google-auth-library';
@@ -500,7 +499,7 @@ app.get('/users/:slackUserId/properties', async (req, res) => {
   try {
     // Get user's tokens from database
     const result = await pool.query(
-      'SELECT access_token, refresh_token FROM user_tokens WHERE slack_user_id = $1',
+      'SELECT google_access_token, google_refresh_token FROM arnold_users WHERE slack_user_id = $1',
       [slackUserId]
     );
     
@@ -511,7 +510,7 @@ app.get('/users/:slackUserId/properties', async (req, res) => {
       });
     }
     
-    const { access_token, refresh_token } = result.rows[0];
+    const { google_access_token, google_refresh_token } = result.rows[0];
     
     // Fetch properties from Google Analytics Admin API
     const response = await axios.get(
