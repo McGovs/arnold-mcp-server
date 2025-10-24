@@ -549,6 +549,55 @@ app.get('/users/:slackUserId/properties', authenticateApiKey, async (req, res) =
   }
 });
 
+// Refresh access token (NEW ENDPOINT)
+app.post('/oauth/refresh', authenticateApiKey, async (req, res) => {
+  const { slackUserId, refreshToken } = req.body;
+  
+  if (!slackUserId || !refreshToken) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing slackUserId or refreshToken' 
+    });
+  }
+  
+  try {
+    // Exchange refresh token for new access token
+    const response = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token'
+    });
+    
+    const newAccessToken = response.data.access_token;
+    const expiresIn = response.data.expires_in || 3600;
+    const newExpiresAt = Date.now() + (expiresIn * 1000);
+    
+    // Update token in database
+    await pool.query(
+      'UPDATE arnold_users SET google_access_token = $1, token_expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE slack_user_id = $3',
+      [newAccessToken, newExpiresAt, slackUserId]
+    );
+    
+    console.log(`Token refreshed for user ${slackUserId}`);
+    
+    res.json({
+      success: true,
+      accessToken: newAccessToken,
+      expiresAt: newExpiresAt,
+      message: 'Token refreshed successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error refreshing token:', error.response?.data || error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to refresh token',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
 // Update user's property ID
 app.patch('/users/:slackUserId/property', authenticateApiKey, async (req, res) => {
   try {
@@ -619,40 +668,6 @@ app.delete('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) =>
     res.status(500).json({
       success: false,
       error: error.message
-    });
-  }
-});
-
-// Token refresh endpoint
-app.post('/oauth/refresh', authenticateApiKey, async (req, res) => {
-  try {
-    const { refreshToken } = req.body;
-
-    if (!refreshToken) {
-      return res.status(400).json({
-        error: 'Refresh token required'
-      });
-    }
-
-    oauth2Client.setCredentials({
-      refresh_token: refreshToken
-    });
-
-    const { credentials } = await oauth2Client.refreshAccessToken();
-
-    res.json({
-      success: true,
-      accessToken: credentials.access_token,
-      expiresIn: credentials.expiry_date ? Math.floor((credentials.expiry_date - Date.now()) / 1000) : 3600,
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    console.error('Token refresh error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to refresh token',
-      message: error.message
     });
   }
 });
