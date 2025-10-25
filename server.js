@@ -78,13 +78,12 @@ async function initDatabaseTables() {
       ON audit_logs(slack_user_id, created_at DESC)
     `);
 
-// Add BigQuery dataset column if it doesn't exist
-await pool.query(`
-  ALTER TABLE arnold_users 
-  ADD COLUMN IF NOT EXISTS bigquery_dataset VARCHAR(500)
-`);
-
-    console.log('✅ BigQuery dataset column added');
+    // Add BigQuery dataset column
+    await pool.query(`
+      ALTER TABLE arnold_users 
+      ADD COLUMN IF NOT EXISTS bigquery_dataset VARCHAR(500)
+    `);
+    
     console.log('✅ Database tables initialized');
   } catch (error) {
     console.error('Database init error:', error);
@@ -447,7 +446,7 @@ app.post('/users/tokens', authenticateApiKey, async (req, res) => {
   }
 });
 
-// Get user tokens (with auto-refresh if expired)
+// Get user tokens (with auto-refresh if expired and BigQuery dataset)
 app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
   try {
     const { slackUserId } = req.params;
@@ -458,7 +457,8 @@ app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
         google_access_token,
         google_refresh_token,
         token_expires_at,
-        ga_property_id
+        ga_property_id,
+        bigquery_dataset
       FROM arnold_users
       WHERE slack_user_id = $1
     `;
@@ -507,7 +507,6 @@ app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
         console.log(`Token refreshed successfully for user ${slackUserId}`);
       } catch (refreshError) {
         console.error('Failed to refresh token:', refreshError.response?.data || refreshError.message);
-        // Return the expired token and let the caller handle it
         return res.json({
           success: true,
           slackUserId: user.slack_user_id,
@@ -516,6 +515,7 @@ app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
           expiresAt: user.token_expires_at,
           isExpired: true,
           propertyId: user.ga_property_id,
+          bigqueryDataset: user.bigquery_dataset,
           refreshFailed: true,
           error: 'Token expired and refresh failed - user needs to re-authenticate'
         });
@@ -530,6 +530,7 @@ app.get('/users/:slackUserId/tokens', authenticateApiKey, async (req, res) => {
       expiresAt: expiresAt,
       isExpired: false,
       propertyId: user.ga_property_id,
+      bigqueryDataset: user.bigquery_dataset,
       wasRefreshed: wasRefreshed
     });
 
@@ -600,6 +601,90 @@ app.get('/users/:slackUserId/properties', authenticateApiKey, async (req, res) =
     res.status(500).json({ 
       success: false, 
       error: error.message 
+    });
+  }
+});
+
+// Get user's BigQuery datasets
+app.get('/users/:slackUserId/datasets', authenticateApiKey, async (req, res) => {
+  const { slackUserId } = req.params;
+  
+  try {
+    console.log(`Fetching BigQuery datasets for user ${slackUserId}`);
+    
+    // Import BigQuery
+    const { BigQuery } = await import('@google-cloud/bigquery');
+    
+    // Initialize BigQuery with service account
+    const bigquery = new BigQuery({
+      projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
+      credentials: JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON)
+    });
+    
+    // Get all datasets the service account has access to
+    const [datasets] = await bigquery.getDatasets();
+    
+    // Format datasets for Slack dropdown
+    const formattedDatasets = datasets.map(dataset => ({
+      id: `${dataset.projectId}.${dataset.id}`,
+      name: dataset.id,
+      projectId: dataset.projectId,
+      fullPath: `${dataset.projectId}.${dataset.id}`
+    }));
+    
+    console.log(`Found ${formattedDatasets.length} datasets`);
+    
+    res.json({
+      success: true,
+      datasets: formattedDatasets
+    });
+    
+  } catch (error) {
+    console.error('Error fetching BigQuery datasets:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Update user's BigQuery dataset
+app.patch('/users/:slackUserId/dataset', authenticateApiKey, async (req, res) => {
+  try {
+    const { slackUserId } = req.params;
+    const { dataset } = req.body;
+
+    if (!dataset) {
+      return res.status(400).json({
+        error: 'Dataset required'
+      });
+    }
+
+    const query = `
+      UPDATE arnold_users
+      SET bigquery_dataset = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE slack_user_id = $2
+      RETURNING slack_user_id, bigquery_dataset
+    `;
+
+    const result = await pool.query(query, [dataset, slackUserId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Error updating BigQuery dataset:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
@@ -734,6 +819,7 @@ app.get('/users', authenticateApiKey, async (req, res) => {
       SELECT 
         slack_user_id,
         ga_property_id,
+        bigquery_dataset,
         token_expires_at,
         created_at,
         updated_at
@@ -749,6 +835,7 @@ app.get('/users', authenticateApiKey, async (req, res) => {
       users: result.rows.map(user => ({
         slackUserId: user.slack_user_id,
         propertyId: user.ga_property_id,
+        bigqueryDataset: user.bigquery_dataset,
         isTokenExpired: Date.now() > user.token_expires_at,
         connectedAt: user.created_at,
         lastUpdated: user.updated_at
@@ -808,6 +895,24 @@ app.get('/docs', (req, res) => {
         description: 'Retrieve user tokens (auto-refreshes if expired)',
         auth: 'X-API-Key header'
       },
+      getProperties: {
+        method: 'GET',
+        path: '/users/:slackUserId/properties',
+        description: 'Get user\'s GA4 properties',
+        auth: 'X-API-Key header'
+      },
+      getDatasets: {
+        method: 'GET',
+        path: '/users/:slackUserId/datasets',
+        description: 'Get BigQuery datasets accessible by service account',
+        auth: 'X-API-Key header'
+      },
+      updateDataset: {
+        method: 'PATCH',
+        path: '/users/:slackUserId/dataset',
+        description: 'Update user\'s BigQuery dataset',
+        auth: 'X-API-Key header'
+      },
       refreshToken: {
         method: 'POST',
         path: '/oauth/refresh',
@@ -834,6 +939,7 @@ async function startServer() {
     console.log(`🔍 MCP endpoint: http://localhost:${PORT}/mcp/analytics`);
     console.log(`📈 Direct endpoint: http://localhost:${PORT}/analytics/query`);
     console.log(`🔄 Token auto-refresh: Enabled in GET /users/:slackUserId/tokens`);
+    console.log(`💾 BigQuery dataset selection: Enabled`);
     console.log(`⚠️  User OAuth token REQUIRED for all analytics queries`);
   });
 }
