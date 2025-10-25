@@ -77,7 +77,14 @@ async function initDatabaseTables() {
       CREATE INDEX IF NOT EXISTS idx_audit_slack_user 
       ON audit_logs(slack_user_id, created_at DESC)
     `);
-    
+
+// Add BigQuery dataset column if it doesn't exist
+await pool.query(`
+  ALTER TABLE arnold_users 
+  ADD COLUMN IF NOT EXISTS bigquery_dataset VARCHAR(500)
+`);
+
+    console.log('✅ BigQuery dataset column added');
     console.log('✅ Database tables initialized');
   } catch (error) {
     console.error('Database init error:', error);
