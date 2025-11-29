@@ -247,16 +247,19 @@ app.post('/mcp/analytics', authenticateApiKey, validateAnalyticsRequest, async (
       authClient: oauth2Client
     });
 
-    const gaRequest = {
-      property: args.property,
-      dateRanges: args.dateRanges || [{ startDate: '7daysAgo', endDate: 'today' }],
-      dimensions: args.dimensions || [],
-      metrics: args.metrics || [],
-      limit: args.limit || 10,
-      offset: args.offset || 0,
-      keepEmptyRows: args.keepEmptyRows !== undefined ? args.keepEmptyRows : false,
-      metricAggregations: args.metricAggregations || []
-    };
+const gaRequest = {
+  property: args.property,
+  dateRanges: args.dateRanges || [{ startDate: '7daysAgo', endDate: 'today' }],
+  dimensions: args.dimensions || [],
+  metrics: args.metrics || [],
+  dimensionFilter: args.dimensionFilter,  // ADD THIS
+  metricFilter: args.metricFilter,        // ADD THIS
+  orderBys: args.orderBys,                // ADD THIS (also missing)
+  limit: args.limit || 10,
+  offset: args.offset || 0,
+  keepEmptyRows: args.keepEmptyRows !== undefined ? args.keepEmptyRows : false,
+  metricAggregations: args.metricAggregations || []
+};
 
     console.log('Sending request to Google Analytics...');
 
